@@ -1,9 +1,11 @@
 import asyncio
+import functools
 import logging
 import os
 import tempfile
 from datetime import datetime
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -15,7 +17,7 @@ from database import init_db, get_conn
 from tools import (
     get_last_messages, save_message, clear_history,
     get_tasks, get_reminders, get_profile, set_profile,
-    load_pinned_facts, search_notes,
+    load_pinned_facts, search_notes, complete_task,
 )
 from llm import call_llm
 
@@ -35,11 +37,28 @@ groq      = Groq(api_key=GROQ_API_KEY)
 
 def owner_only(func):
     """Decorator: only MY_TELEGRAM_ID can use the bot."""
-    async def wrapper(message: Message, *args, **kwargs):
+    @functools.wraps(func)  # сохраняет сигнатуру — aiogram не будет пробрасывать лишние kwargs
+    async def wrapper(message: Message, **kwargs):
         if message.from_user.id != MY_TELEGRAM_ID:
-            return  # Silently ignore
-        return await func(message, *args, **kwargs)
+            return
+        return await func(message)
     return wrapper
+
+
+# ─── Health check (нужен для Render Web Service) ──────────────────────────────
+
+async def health(request):
+    return web.Response(text="OK")
+
+async def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check server started on port {port}")
 
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
@@ -124,7 +143,6 @@ async def cmd_done(message: Message):
     if len(parts) < 2 or not parts[1].isdigit():
         await message.answer("Укажи ID задачи: /done [id]")
         return
-    from tools import complete_task
     await message.answer(complete_task(int(parts[1])))
 
 
@@ -134,7 +152,6 @@ async def cmd_done(message: Message):
 @owner_only
 async def handle_voice(message: Message):
     await bot.send_chat_action(message.chat.id, "typing")
-
     try:
         file_info   = await bot.get_file(message.voice.file_id)
         voice_bytes = await bot.download_file(file_info.file_path)
@@ -169,6 +186,9 @@ async def handle_voice(message: Message):
 @dp.message(F.text & ~F.text.startswith("/"))
 @owner_only
 async def handle_text(message: Message):
+    profile = get_profile()
+    if not profile:
+        await maybe_extract_profile(message.text)
     await process_message(message, message.text)
 
 
@@ -177,9 +197,7 @@ async def handle_text(message: Message):
 async def process_message(message: Message, text: str):
     save_message("user", text)
     history = get_last_messages(n=20)
-
     await bot.send_chat_action(message.chat.id, "typing")
-
     try:
         response = call_llm(history)
         save_message("assistant", response)
@@ -189,17 +207,13 @@ async def process_message(message: Message, text: str):
         await message.answer("❌ Ошибка. Попробуй ещё раз.")
 
 
-# ─── Profile auto-setup on first mention ──────────────────────────────────────
+# ─── Profile auto-extract ─────────────────────────────────────────────────────
 
 async def maybe_extract_profile(text: str):
-    """Ask LLM to extract profile data from setup message."""
-    profile = get_profile()
-    if profile:
-        return  # Already set up
-
+    import json
     extract_prompt = (
         "Извлеки из текста: имя пользователя, его цели, стиль общения.\n"
-        "Ответь строго в JSON: {\"name\": \"...\", \"goals\": \"...\", \"style\": \"...\"}\n"
+        "Ответь строго в JSON без markdown: {\"name\": \"...\", \"goals\": \"...\", \"style\": \"...\"}\n"
         f"Текст: {text}"
     )
     try:
@@ -209,9 +223,7 @@ async def maybe_extract_profile(text: str):
             max_tokens=200,
             temperature=0,
         )
-        import json
         raw = resp.choices[0].message.content or "{}"
-        # Strip markdown fences if any
         raw = raw.strip().strip("```json").strip("```").strip()
         data = json.loads(raw)
         for k, v in data.items():
@@ -221,43 +233,18 @@ async def maybe_extract_profile(text: str):
         logger.warning(f"Profile extract failed: {e}")
 
 
-# Override setup handler to also extract profile
-@dp.message(Command("setup"))
-@owner_only
-async def cmd_setup_handler(message: Message):
-    await message.answer(
-        "Расскажи о себе — я всё запомню.\n\n"
-        "Например:\n"
-        "«Меня зовут Макс. Цели: запустить SaaS и выйти на $5k MRR. "
-        "Предпочитаю краткие ответы без воды. Работаю по утрам.»"
-    )
-
-
-@dp.message(F.text & ~F.text.startswith("/"))
-@owner_only
-async def handle_text_with_profile(message: Message):
-    profile = get_profile()
-    if not profile:
-        # First message — try to extract profile
-        await maybe_extract_profile(message.text)
-    await process_message(message, message.text)
-
-
 # ─── Reminder scheduler ───────────────────────────────────────────────────────
 
 async def check_reminders():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "SELECT * FROM reminders WHERE sent = 0 AND remind_at <= ?", (now,)
-    )
+    c.execute("SELECT * FROM reminders WHERE sent = 0 AND remind_at <= ?", (now,))
     rows = c.fetchall()
     for row in rows:
         try:
             await bot.send_message(MY_TELEGRAM_ID, f"⏰ {row['title']}")
             c.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (row["id"],))
-            logger.info(f"Reminder sent: {row['title']}")
         except Exception as e:
             logger.error(f"Reminder send error: {e}")
     conn.commit()
@@ -273,6 +260,8 @@ async def main():
     scheduler.add_job(check_reminders, "interval", minutes=1)
     scheduler.start()
     logger.info("Scheduler started")
+
+    await run_web_server()
 
     logger.info("Bot polling started")
     await dp.start_polling(bot)
