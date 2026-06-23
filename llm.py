@@ -1,17 +1,107 @@
 import json
+import logging
 from datetime import datetime
-from groq import Groq
-from config import GROQ_API_KEY, MODEL
+
+from groq import Groq, AuthenticationError
+from config import GROQ_API_KEY, MODELS
 from tools import (
     create_task, get_tasks, complete_task,
     save_note, search_notes,
     create_reminder, get_reminders,
     pin_fact, load_pinned_facts, get_profile,
+    count_messages_since_last_summary, get_messages_for_summary,
+    save_summary, get_latest_summary,
 )
+from config import SUMMARY_INTERVAL
+
+logger = logging.getLogger(__name__)
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# ─── Tool definitions (Groq/OpenAI format) ────────────────────────────────────
+
+# ─── Model fallback ───────────────────────────────────────────────────────────
+
+def _call_with_fallback(**kwargs) -> object:
+    """Try each model in MODELS in order. Skip to the next on any error
+    except AuthenticationError (wrong key — no point retrying)."""
+    last_err = None
+    for model in MODELS:
+        try:
+            return client.chat.completions.create(model=model, **kwargs)
+        except AuthenticationError:
+            raise  # same key, same result on every model
+        except Exception as e:
+            logger.warning("Model %s failed (%s: %s), trying next", model, type(e).__name__, e)
+            last_err = e
+    raise last_err or RuntimeError("All models in MODELS list exhausted")
+
+
+# ─── System prompt (kept short on purpose) ───────────────────────────────────
+
+def build_system_prompt() -> str:
+    profile = get_profile()
+    pinned  = load_pinned_facts()
+    now     = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    name  = profile.get("name", "—")
+    goals = profile.get("goals", "—")
+    style = profile.get("style", "кратко и прямо")
+    extra = profile.get("extra", "")
+
+    lines = [
+        f"Личный ассистент. Сейчас: {now}.",
+        f"Пользователь: {name}. Цели: {goals}. Стиль: {style}.",
+        "Правила: отвечай кратко, на русском, без воды.",
+        "Инструменты используй автоматически — не спрашивай лишний раз.",
+        "Новый важный факт о пользователе → сохрани через pin_fact.",
+    ]
+    if extra:
+        lines.append(f"Доп. контекст: {extra}.")
+    if pinned:
+        lines.append(f"Запомненные факты:\n{pinned}")
+
+    return "\n".join(lines)
+
+
+# ─── Summary generation (runs in background thread) ──────────────────────────
+
+def maybe_generate_summary():
+    """Called after every user message. Generates a summary every
+    SUMMARY_INTERVAL messages and stores it in the DB."""
+    count = count_messages_since_last_summary()
+    if count < SUMMARY_INTERVAL:
+        return
+
+    messages = get_messages_for_summary(SUMMARY_INTERVAL)
+    if not messages:
+        return
+
+    dialogue = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+    try:
+        # Use a dedicated client instance — this runs in a thread pool
+        _client = Groq(api_key=GROQ_API_KEY)
+        resp = _client.chat.completions.create(
+            model=MODELS[0],  # always use the fastest model for summaries
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Сделай краткое summary диалога в 3-4 предложениях. "
+                    "Только факты: что обсуждали, что решили, что создали.\n\n"
+                    + dialogue
+                ),
+            }],
+            max_tokens=200,
+            temperature=0.3,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if text:
+            save_summary(text, count)
+            logger.info("Conversation summary saved (%d messages)", count)
+    except Exception as e:
+        logger.warning("Summary generation failed: %s", e)
+
+
+# ─── Tool definitions ─────────────────────────────────────────────────────────
 
 TOOL_DEFINITIONS = [
     {
@@ -22,9 +112,9 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title":    {"type": "string", "description": "Название задачи"},
+                    "title":    {"type": "string"},
                     "priority": {"type": "string", "enum": ["high", "medium", "low"]},
-                    "deadline": {"type": "string", "description": "Дедлайн YYYY-MM-DD или null"},
+                    "deadline": {"type": "string", "description": "YYYY-MM-DD или null"},
                 },
                 "required": ["title"],
             },
@@ -34,11 +124,11 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_tasks",
-            "description": "Получить список активных задач пользователя.",
+            "description": "Получить список активных задач.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "show_completed": {"type": "boolean", "description": "true — показать выполненные"},
+                    "show_completed": {"type": "boolean"},
                 },
             },
         },
@@ -47,11 +137,11 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "complete_task",
-            "description": "Отметить задачу как выполненную по ID.",
+            "description": "Отметить задачу выполненной по ID.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "integer", "description": "ID задачи"},
+                    "task_id": {"type": "integer"},
                 },
                 "required": ["task_id"],
             },
@@ -61,12 +151,12 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "save_note",
-            "description": "Сохранить заметку, идею, мысль. Вызывай когда пользователь хочет что-то записать.",
+            "description": "Сохранить заметку, идею, мысль.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "Содержание заметки"},
-                    "tags":    {"type": "string", "description": "Теги через запятую, например: работа,идея"},
+                    "content": {"type": "string"},
+                    "tags":    {"type": "string", "description": "Теги через запятую"},
                 },
                 "required": ["content"],
             },
@@ -76,11 +166,11 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "search_notes",
-            "description": "Найти заметки по ключевым словам через FTS5 поиск.",
+            "description": "Найти заметки по ключевым словам (FTS5).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Поисковый запрос"},
+                    "query": {"type": "string"},
                 },
                 "required": ["query"],
             },
@@ -94,8 +184,8 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title":     {"type": "string", "description": "Текст напоминания"},
-                    "remind_at": {"type": "string", "description": "Время в формате YYYY-MM-DD HH:MM"},
+                    "title":     {"type": "string"},
+                    "remind_at": {"type": "string", "description": "YYYY-MM-DD HH:MM"},
                 },
                 "required": ["title", "remind_at"],
             },
@@ -113,11 +203,11 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "pin_fact",
-            "description": "Запомнить важный факт о пользователе навсегда (цели, предпочтения, контекст).",
+            "description": "Запомнить важный факт о пользователе навсегда.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "Важный факт"},
+                    "content": {"type": "string"},
                 },
                 "required": ["content"],
             },
@@ -126,73 +216,48 @@ TOOL_DEFINITIONS = [
 ]
 
 TOOL_MAP = {
-    "create_task":    create_task,
-    "get_tasks":      get_tasks,
-    "complete_task":  complete_task,
-    "save_note":      save_note,
-    "search_notes":   search_notes,
+    "create_task":     create_task,
+    "get_tasks":       get_tasks,
+    "complete_task":   complete_task,
+    "save_note":       save_note,
+    "search_notes":    search_notes,
     "create_reminder": create_reminder,
-    "get_reminders":  get_reminders,
-    "pin_fact":       pin_fact,
+    "get_reminders":   get_reminders,
+    "pin_fact":        pin_fact,
 }
-
-
-# ─── System prompt ─────────────────────────────────────────────────────────────
-
-def build_system_prompt() -> str:
-    profile = get_profile()
-    pinned  = load_pinned_facts()
-    now     = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    name   = profile.get("name", "не указано")
-    goals  = profile.get("goals", "не указаны")
-    style  = profile.get("style", "краткий и прямой")
-    extra  = profile.get("extra", "")
-
-    return f"""Ты — личный AI-ассистент.
-
-Сейчас: {now}
-
-## Профиль пользователя
-- Имя: {name}
-- Цели: {goals}
-- Стиль общения: {style}
-{('- Дополнительно: ' + extra) if extra else ''}
-
-## Запомненные факты
-{pinned if pinned else '(пока нет)'}
-
-## Правила
-- Отвечаешь кратко и по делу, без воды
-- Автоматически создаёшь задачи/заметки/напоминания через инструменты — не спрашивай лишний раз
-- Если видишь новый важный факт о пользователе — сохраняй через pin_fact
-- Всегда отвечаешь на русском
-- Никакой мотивашки и «ты справишься» — только конкретные действия
-"""
 
 
 # ─── Main LLM call with tool loop ─────────────────────────────────────────────
 
 def call_llm(messages: list[dict]) -> str:
-    system_prompt = build_system_prompt()
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
+    system_prompt  = build_system_prompt()
+    latest_summary = get_latest_summary()
 
-    response = client.chat.completions.create(
-        model=MODEL,
+    # Context: system → [summary block] → last N messages
+    # Summary replaces the long history, keeping the window small.
+    context: list[dict] = []
+    if latest_summary:
+        context.append({"role": "user",      "content": f"[Контекст прошлого диалога]\n{latest_summary}"})
+        context.append({"role": "assistant", "content": "Понял, учту."})
+    context.extend(messages)
+
+    full_messages = [{"role": "system", "content": system_prompt}] + context
+
+    response = _call_with_fallback(
         messages=full_messages,
         tools=TOOL_DEFINITIONS,
         tool_choice="auto",
-        max_tokens=1000,
+        max_tokens=800,
         temperature=0.7,
     )
 
     msg = response.choices[0].message
 
-    # No tools needed — return text directly
+    # No tool calls — return text directly
     if not msg.tool_calls:
         return msg.content or "…"
 
-    # Execute all tool calls
+    # Execute every requested tool
     tool_results = []
     for tc in msg.tool_calls:
         func_name = tc.function.name
@@ -210,28 +275,22 @@ def call_llm(messages: list[dict]) -> str:
             "content":      result,
         })
 
-    # Build assistant message with tool_calls (dict format for API)
     tool_calls_dicts = [
         {
             "id":   tc.id,
             "type": "function",
-            "function": {
-                "name":      tc.function.name,
-                "arguments": tc.function.arguments,
-            },
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
         }
         for tc in msg.tool_calls
     ]
 
-    # Second call: model summarises tool results
     final_messages = (
         full_messages
         + [{"role": "assistant", "content": msg.content or "", "tool_calls": tool_calls_dicts}]
         + tool_results
     )
 
-    final = client.chat.completions.create(
-        model=MODEL,
+    final = _call_with_fallback(
         messages=final_messages,
         max_tokens=500,
         temperature=0.7,
