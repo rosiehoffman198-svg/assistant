@@ -177,7 +177,7 @@ def set_profile(key: str, value: str):
 
 # ─── Message history ──────────────────────────────────────────────────────────
 
-def get_last_messages(n: int = 20) -> list[dict]:
+def get_last_messages(n: int = 6) -> list[dict]:
     conn = get_conn()
     c = conn.cursor()
     c.execute(
@@ -203,3 +203,58 @@ def clear_history():
     c.execute("DELETE FROM messages")
     conn.commit()
     conn.close()
+
+
+# ─── Conversation summaries ───────────────────────────────────────────────────
+
+def count_messages_since_last_summary() -> int:
+    """How many messages have accumulated since the last saved summary."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT created_at FROM conversation_summaries ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    if row:
+        c.execute("SELECT COUNT(*) FROM messages WHERE created_at > ?", (row["created_at"],))
+    else:
+        c.execute("SELECT COUNT(*) FROM messages")
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_messages_for_summary(limit: int = 20) -> list[dict]:
+    """Messages accumulated since the last summary, up to `limit`."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT created_at FROM conversation_summaries ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    if row:
+        c.execute(
+            "SELECT role, content FROM messages WHERE created_at > ? ORDER BY id LIMIT ?",
+            (row["created_at"], limit),
+        )
+    else:
+        c.execute("SELECT role, content FROM messages ORDER BY id LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def save_summary(content: str, messages_count: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO conversation_summaries (content, messages_count) VALUES (?, ?)",
+        (content, messages_count),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_latest_summary() -> str:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT content FROM conversation_summaries ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return row["content"] if row else ""
