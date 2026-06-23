@@ -1,10 +1,11 @@
-import sqlite3
-from config import DB_PATH
+import psycopg2
+import psycopg2.extras
+from config import DATABASE_URL
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def get_conn() -> psycopg2.extensions.connection:
+    """Return a psycopg2 connection with RealDictCursor as default."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 
@@ -22,7 +23,7 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             role       TEXT NOT NULL,
             content    TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -31,7 +32,7 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             title      TEXT NOT NULL,
             priority   TEXT DEFAULT 'medium',
             deadline   TEXT,
@@ -42,22 +43,24 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS notes (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             content    TEXT NOT NULL,
             tags       TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # FTS5 — real search, not fake storage
+    # GIN index for full-text search (replaces SQLite FTS5)
     c.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
-        USING fts5(content, tags, note_id UNINDEXED)
+        CREATE INDEX IF NOT EXISTS notes_fts_idx
+        ON notes USING GIN (
+            to_tsvector('simple', content || ' ' || COALESCE(tags, ''))
+        )
     """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             title      TEXT NOT NULL,
             remind_at  TEXT NOT NULL,
             sent       INTEGER DEFAULT 0,
@@ -67,16 +70,15 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS pinned_facts (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             content    TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # ── Conversation summaries (generated every SUMMARY_INTERVAL messages) ────
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversation_summaries (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            id             SERIAL PRIMARY KEY,
             content        TEXT NOT NULL,
             messages_count INTEGER DEFAULT 0,
             created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
