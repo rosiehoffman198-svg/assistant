@@ -12,14 +12,14 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from groq import Groq
 
-from config import TELEGRAM_TOKEN, GROQ_API_KEY, MY_TELEGRAM_ID
+from config import TELEGRAM_TOKEN, GROQ_API_KEY, MY_TELEGRAM_ID, HISTORY_LIMIT, MODELS
 from database import init_db, get_conn
 from tools import (
     get_last_messages, save_message, clear_history,
     get_tasks, get_reminders, get_profile, set_profile,
     load_pinned_facts, search_notes, complete_task,
 )
-from llm import call_llm
+from llm import call_llm, maybe_generate_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,7 +196,12 @@ async def handle_text(message: Message):
 
 async def process_message(message: Message, text: str):
     save_message("user", text)
-    history = get_last_messages(n=20)
+
+    # Generate summary in background every SUMMARY_INTERVAL messages.
+    # Runs in a thread-pool so it never delays the response.
+    asyncio.create_task(asyncio.to_thread(maybe_generate_summary))
+
+    history = get_last_messages(n=HISTORY_LIMIT)
     await bot.send_chat_action(message.chat.id, "typing")
     try:
         response = call_llm(history)
@@ -218,7 +223,7 @@ async def maybe_extract_profile(text: str):
     )
     try:
         resp = groq.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=MODELS[0],  # use fastest model for lightweight extraction
             messages=[{"role": "user", "content": extract_prompt}],
             max_tokens=200,
             temperature=0,
