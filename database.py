@@ -1,11 +1,11 @@
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 from config import DATABASE_URL
 
 
-def get_conn() -> psycopg2.extensions.connection:
-    """Return a psycopg2 connection with RealDictCursor as default."""
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+def get_conn() -> psycopg.Connection:
+    """Return a psycopg3 connection with dict rows as default."""
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     return conn
 
 
