@@ -73,5 +73,15 @@ def init_db():
         )
     """)
 
+    # ── Conversation summaries (generated every SUMMARY_INTERVAL messages) ────
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_summaries (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            content        TEXT NOT NULL,
+            messages_count INTEGER DEFAULT 0,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
