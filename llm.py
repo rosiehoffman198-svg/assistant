@@ -1,120 +1,41 @@
 import json
 import logging
 from datetime import datetime
-
-from groq import Groq, AuthenticationError
-from config import GROQ_API_KEY, MODELS
+from groq import Groq
+from config import GROQ_API_KEY, MODELS, SUMMARY_INTERVAL
 from tools import (
     create_task, get_tasks, complete_task,
     save_note, search_notes,
     create_reminder, get_reminders,
     pin_fact, load_pinned_facts, get_profile,
+    create_project, get_projects, update_project, get_active_projects_summary,
     count_messages_since_last_summary, get_messages_for_summary,
     save_summary, get_latest_summary,
 )
-from config import SUMMARY_INTERVAL
 
 logger = logging.getLogger(__name__)
-
 client = Groq(api_key=GROQ_API_KEY)
 
 
-# ─── Model fallback ───────────────────────────────────────────────────────────
-
-def _call_with_fallback(**kwargs) -> object:
-    """Try each model in MODELS in order. Skip to the next on any error
-    except AuthenticationError (wrong key — no point retrying)."""
-    last_err = None
-    for model in MODELS:
-        try:
-            return client.chat.completions.create(model=model, **kwargs)
-        except AuthenticationError:
-            raise  # same key, same result on every model
-        except Exception as e:
-            logger.warning("Model %s failed (%s: %s), trying next", model, type(e).__name__, e)
-            last_err = e
-    raise last_err or RuntimeError("All models in MODELS list exhausted")
-
-
-# ─── System prompt (kept short on purpose) ───────────────────────────────────
-
-def build_system_prompt() -> str:
-    profile = get_profile()
-    pinned  = load_pinned_facts()
-    now     = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    name  = profile.get("name", "—")
-    goals = profile.get("goals", "—")
-    style = profile.get("style", "кратко и прямо")
-    extra = profile.get("extra", "")
-
-    lines = [
-        f"Личный ассистент. Сейчас: {now}.",
-        f"Пользователь: {name}. Цели: {goals}. Стиль: {style}.",
-        "Правила: отвечай кратко, на русском, без воды.",
-        "Инструменты используй автоматически — не спрашивай лишний раз.",
-        "Новый важный факт о пользователе → сохрани через pin_fact.",
-    ]
-    if extra:
-        lines.append(f"Доп. контекст: {extra}.")
-    if pinned:
-        lines.append(f"Запомненные факты:\n{pinned}")
-
-    return "\n".join(lines)
-
-
-# ─── Summary generation (runs in background thread) ──────────────────────────
-
-def maybe_generate_summary():
-    """Called after every user message. Generates a summary every
-    SUMMARY_INTERVAL messages and stores it in the DB."""
-    count = count_messages_since_last_summary()
-    if count < SUMMARY_INTERVAL:
-        return
-
-    messages = get_messages_for_summary(SUMMARY_INTERVAL)
-    if not messages:
-        return
-
-    dialogue = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-    try:
-        # Use a dedicated client instance — this runs in a thread pool
-        _client = Groq(api_key=GROQ_API_KEY)
-        resp = _client.chat.completions.create(
-            model=MODELS[0],  # always use the fastest model for summaries
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Сделай краткое summary диалога в 3-4 предложениях. "
-                    "Только факты: что обсуждали, что решили, что создали.\n\n"
-                    + dialogue
-                ),
-            }],
-            max_tokens=200,
-            temperature=0.3,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        if text:
-            save_summary(text, count)
-            logger.info("Conversation summary saved (%d messages)", count)
-    except Exception as e:
-        logger.warning("Summary generation failed: %s", e)
-
-
-# ─── Tool definitions ─────────────────────────────────────────────────────────
+# ─── Tool definitions ──────────────────────────────────────────────────────────
 
 TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
             "name": "create_task",
-            "description": "Создать задачу. Вызывай когда пользователь упоминает что нужно сделать.",
+            "description": "Создать задачу. Указывай importance и energy если понятно из контекста.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title":    {"type": "string"},
-                    "priority": {"type": "string", "enum": ["high", "medium", "low"]},
-                    "deadline": {"type": "string", "description": "YYYY-MM-DD или null"},
+                    "title":      {"type": "string"},
+                    "priority":   {"type": "string", "enum": ["high", "medium", "low"]},
+                    "importance": {"type": "string", "enum": ["high", "medium", "low"],
+                                   "description": "Важность для достижения целей"},
+                    "energy":     {"type": "string", "enum": ["high", "low"],
+                                   "description": "Сколько энергии требует задача"},
+                    "deadline":   {"type": "string", "description": "YYYY-MM-DD или null"},
+                    "project_id": {"type": "integer", "description": "ID проекта или null"},
                 },
                 "required": ["title"],
             },
@@ -124,11 +45,13 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_tasks",
-            "description": "Получить список активных задач.",
+            "description": "Получить список задач. Можно фильтровать по энергии или проекту.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "show_completed": {"type": "boolean"},
+                    "energy":        {"type": "string", "enum": ["high", "low"]},
+                    "project_id":    {"type": "integer"},
                 },
             },
         },
@@ -137,12 +60,10 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "complete_task",
-            "description": "Отметить задачу выполненной по ID.",
+            "description": "Отметить задачу как выполненную.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "task_id": {"type": "integer"},
-                },
+                "properties": {"task_id": {"type": "integer"}},
                 "required": ["task_id"],
             },
         },
@@ -150,13 +71,59 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "create_project",
+            "description": "Создать проект с целью и статусом.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":   {"type": "string"},
+                    "goal":   {"type": "string", "description": "Измеримая цель проекта"},
+                    "status": {"type": "string", "enum": ["active", "paused", "done"]},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_projects",
+            "description": "Показать список проектов.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status_filter": {"type": "string", "enum": ["active", "paused", "done"]},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_project",
+            "description": "Обновить статус, цель или название проекта.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "integer"},
+                    "name":       {"type": "string"},
+                    "status":     {"type": "string", "enum": ["active", "paused", "done"]},
+                    "goal":       {"type": "string"},
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_note",
-            "description": "Сохранить заметку, идею, мысль.",
+            "description": "Сохранить заметку или идею.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
-                    "tags":    {"type": "string", "description": "Теги через запятую"},
+                    "tags":    {"type": "string"},
                 },
                 "required": ["content"],
             },
@@ -166,12 +133,10 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "search_notes",
-            "description": "Найти заметки по ключевым словам (FTS5).",
+            "description": "Найти заметки по ключевым словам.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                },
+                "properties": {"query": {"type": "string"}},
                 "required": ["query"],
             },
         },
@@ -206,9 +171,7 @@ TOOL_DEFINITIONS = [
             "description": "Запомнить важный факт о пользователе навсегда.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                },
+                "properties": {"content": {"type": "string"}},
                 "required": ["content"],
             },
         },
@@ -216,83 +179,145 @@ TOOL_DEFINITIONS = [
 ]
 
 TOOL_MAP = {
-    "create_task":     create_task,
-    "get_tasks":       get_tasks,
-    "complete_task":   complete_task,
-    "save_note":       save_note,
-    "search_notes":    search_notes,
+    "create_task":    create_task,
+    "get_tasks":      get_tasks,
+    "complete_task":  complete_task,
+    "create_project": create_project,
+    "get_projects":   get_projects,
+    "update_project": update_project,
+    "save_note":      save_note,
+    "search_notes":   search_notes,
     "create_reminder": create_reminder,
-    "get_reminders":   get_reminders,
-    "pin_fact":        pin_fact,
+    "get_reminders":  get_reminders,
+    "pin_fact":       pin_fact,
 }
 
 
-# ─── Main LLM call with tool loop ─────────────────────────────────────────────
+# ─── System prompt ─────────────────────────────────────────────────────────────
+
+def build_system_prompt() -> str:
+    profile  = get_profile()
+    pinned   = load_pinned_facts()
+    projects = get_active_projects_summary()
+    summary  = get_latest_summary()
+    now      = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    name  = profile.get("name",  "не указано")
+    goals = profile.get("goals", "не указаны")
+    style = profile.get("style", "краткий и прямой")
+    extra = profile.get("extra", "")
+
+    return f"""Ты — личный AI-ассистент.
+
+Сейчас: {now}
+
+## Профиль
+- Имя: {name}
+- Цели: {goals}
+- Стиль: {style}
+{('- ' + extra) if extra else ''}
+
+## Активные проекты
+{projects if projects else '(нет)'}
+
+## Запомненные факты
+{pinned if pinned else '(нет)'}
+
+## Контекст прошлых разговоров
+{summary if summary else '(нет)'}
+
+## Правила
+- Отвечаешь кратко и по делу, без воды
+- Автоматически создаёшь задачи/заметки/напоминания/проекты через инструменты
+- При создании задачи — указывай importance и energy если ясно из контекста
+- Если знаешь к какому проекту задача — привязывай через project_id
+- Если видишь важный факт о пользователе — сохраняй через pin_fact
+- Всегда отвечаешь на русском
+- Никакой мотивации ради мотивации — только конкретные действия
+"""
+
+
+# ─── Main LLM call ─────────────────────────────────────────────────────────────
 
 def call_llm(messages: list[dict]) -> str:
-    system_prompt  = build_system_prompt()
-    latest_summary = get_latest_summary()
+    system_prompt = build_system_prompt()
+    full_messages = [{"role": "system", "content": system_prompt}] + messages
 
-    # Context: system → [summary block] → last N messages
-    # Summary replaces the long history, keeping the window small.
-    context: list[dict] = []
-    if latest_summary:
-        context.append({"role": "user",      "content": f"[Контекст прошлого диалога]\n{latest_summary}"})
-        context.append({"role": "assistant", "content": "Понял, учту."})
-    context.extend(messages)
-
-    full_messages = [{"role": "system", "content": system_prompt}] + context
-
-    response = _call_with_fallback(
-        messages=full_messages,
-        tools=TOOL_DEFINITIONS,
-        tool_choice="auto",
-        max_tokens=800,
-        temperature=0.7,
-    )
+    response = None
+    for model in MODELS:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=full_messages,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
+                max_tokens=1000,
+                temperature=0.7,
+            )
+            break
+        except Exception as e:
+            logger.warning(f"Model {model} failed: {e}")
+    if response is None:
+        return "❌ Все модели недоступны. Попробуй позже."
 
     msg = response.choices[0].message
-
-    # No tool calls — return text directly
     if not msg.tool_calls:
         return msg.content or "…"
 
-    # Execute every requested tool
+    # Execute tools
     tool_results = []
     for tc in msg.tool_calls:
-        func_name = tc.function.name
         try:
             func_args = json.loads(tc.function.arguments)
         except json.JSONDecodeError:
             func_args = {}
-
-        tool_func = TOOL_MAP.get(func_name)
-        result = tool_func(**func_args) if tool_func else f"Инструмент {func_name} не найден"
-
-        tool_results.append({
-            "role":         "tool",
-            "tool_call_id": tc.id,
-            "content":      result,
-        })
+        tool_func = TOOL_MAP.get(tc.function.name)
+        result    = tool_func(**func_args) if tool_func else f"Инструмент {tc.function.name} не найден"
+        tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     tool_calls_dicts = [
-        {
-            "id":   tc.id,
-            "type": "function",
-            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-        }
+        {"id": tc.id, "type": "function",
+         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
         for tc in msg.tool_calls
     ]
 
-    final_messages = (
-        full_messages
-        + [{"role": "assistant", "content": msg.content or "", "tool_calls": tool_calls_dicts}]
-        + tool_results
-    )
-
-    final = _call_with_fallback(
-        messages=final_messages,
+    final = client.chat.completions.create(
+        model=MODELS[0],
+        messages=(
+            full_messages
+            + [{"role": "assistant", "content": msg.content or "", "tool_calls": tool_calls_dicts}]
+            + tool_results
+        ),
         max_tokens=500,
         temperature=0.7,
     )
     return final.choices[0].message.content or "Готово."
+
+
+# ─── Summary generation ────────────────────────────────────────────────────────
+
+def maybe_generate_summary():
+    """Called after each message. Generates summary if SUMMARY_INTERVAL reached."""
+    count = count_messages_since_last_summary()
+    if count < SUMMARY_INTERVAL:
+        return
+    messages = get_messages_for_summary(limit=SUMMARY_INTERVAL)
+    if not messages:
+        return
+    prompt = (
+        "Сожми в 5-7 ключевых фактов о пользователе, его задачах и работе. "
+        "Только факты, без воды. Буллет-поинты на русском.\n\n"
+        + "\n".join(f"{m['role']}: {m['content'][:200]}" for m in messages)
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=MODELS[0],
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.3,
+        )
+        summary = resp.choices[0].message.content or ""
+        if summary:
+            save_summary(summary, count)
+    except Exception as e:
+        logger.warning(f"Summary generation failed: {e}")

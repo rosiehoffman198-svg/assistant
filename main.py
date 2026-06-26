@@ -13,12 +13,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from groq import Groq
 
 from config import TELEGRAM_TOKEN, GROQ_API_KEY, MY_TELEGRAM_ID, HISTORY_LIMIT, MODELS
-from database import init_db
+from database import init_db, get_conn
 from tools import (
     get_last_messages, save_message, clear_history,
     get_tasks, get_reminders, get_profile, set_profile,
     load_pinned_facts, search_notes, complete_task,
-    get_due_reminders, mark_reminder_sent,
 )
 from llm import call_llm, maybe_generate_summary
 
@@ -71,7 +70,10 @@ async def cmd_start(message: Message):
         "👋 Привет! Я твой личный ассистент.\n\n"
         "Просто пиши или отправляй голосовые — я сам разберусь.\n\n"
         "Команды:\n"
-        "/tasks — список задач\n"
+        "/tasks — все задачи\n"
+        "/tasks low — задачи с низкой энергией\n"
+        "/tasks high — задачи с высокой энергией\n"
+        "/projects — проекты\n"
         "/reminders — напоминания\n"
         "/search [запрос] — поиск по заметкам\n"
         "/profile — профиль\n"
@@ -84,8 +86,22 @@ async def cmd_start(message: Message):
 @dp.message(Command("tasks"))
 @owner_only
 async def cmd_tasks(message: Message):
-    await message.answer(get_tasks())
+    parts = message.text.split(maxsplit=1)
+    arg   = parts[1].lower().strip() if len(parts) > 1 else None
+    if arg in ("low", "low-energy", "лёгкие"):
+        await message.answer(get_tasks(energy="low"))
+    elif arg in ("high", "high-energy", "сложные"):
+        await message.answer(get_tasks(energy="high"))
+    elif arg in ("done", "выполненные"):
+        await message.answer(get_tasks(show_completed=True))
+    else:
+        await message.answer(get_tasks())
 
+
+@dp.message(Command("projects"))
+@owner_only
+async def cmd_projects(message: Message):
+    await message.answer(get_projects())
 
 @dp.message(Command("reminders"))
 @owner_only
@@ -243,14 +259,18 @@ async def maybe_extract_profile(text: str):
 
 async def check_reminders():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    rows = get_due_reminders(now)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM reminders WHERE sent = 0 AND remind_at <= ?", (now,))
+    rows = c.fetchall()
     for row in rows:
         try:
             await bot.send_message(MY_TELEGRAM_ID, f"⏰ {row['title']}")
-            mark_reminder_sent(row["id"])
-            logger.info(f"Reminder sent: {row['title']}")
+            c.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (row["id"],))
         except Exception as e:
             logger.error(f"Reminder send error: {e}")
+    conn.commit()
+    conn.close()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
