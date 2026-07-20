@@ -12,7 +12,7 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from groq import Groq
 
-from config import TELEGRAM_TOKEN, GROQ_API_KEY, MY_TELEGRAM_ID, HISTORY_LIMIT, MODELS
+from config import TELEGRAM_TOKEN, GROQ_API_KEY, MY_TELEGRAM_ID, HISTORY_LIMIT, MODELS, WHISPER_MODEL
 from database import init_db, get_conn
 from tools import (
     get_last_messages, save_message, clear_history,
@@ -70,10 +70,7 @@ async def cmd_start(message: Message):
         "👋 Привет! Я твой личный ассистент.\n\n"
         "Просто пиши или отправляй голосовые — я сам разберусь.\n\n"
         "Команды:\n"
-        "/tasks — все задачи\n"
-        "/tasks low — задачи с низкой энергией\n"
-        "/tasks high — задачи с высокой энергией\n"
-        "/projects — проекты\n"
+        "/tasks — список задач\n"
         "/reminders — напоминания\n"
         "/search [запрос] — поиск по заметкам\n"
         "/profile — профиль\n"
@@ -86,22 +83,8 @@ async def cmd_start(message: Message):
 @dp.message(Command("tasks"))
 @owner_only
 async def cmd_tasks(message: Message):
-    parts = message.text.split(maxsplit=1)
-    arg   = parts[1].lower().strip() if len(parts) > 1 else None
-    if arg in ("low", "low-energy", "лёгкие"):
-        await message.answer(get_tasks(energy="low"))
-    elif arg in ("high", "high-energy", "сложные"):
-        await message.answer(get_tasks(energy="high"))
-    elif arg in ("done", "выполненные"):
-        await message.answer(get_tasks(show_completed=True))
-    else:
-        await message.answer(get_tasks())
+    await message.answer(get_tasks())
 
-
-@dp.message(Command("projects"))
-@owner_only
-async def cmd_projects(message: Message):
-    await message.answer(get_projects())
 
 @dp.message(Command("reminders"))
 @owner_only
@@ -180,7 +163,7 @@ async def handle_voice(message: Message):
         with open(tmp_path, "rb") as audio:
             transcription = groq.audio.transcriptions.create(
                 file=("voice.ogg", audio, "audio/ogg"),
-                model="whisper-large-v3",
+                model=WHISPER_MODEL,
                 language="ru",
             )
         os.unlink(tmp_path)
