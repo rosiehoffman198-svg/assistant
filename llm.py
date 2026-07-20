@@ -16,6 +16,10 @@ from tools import (
 logger = logging.getLogger(__name__)
 client = Groq(api_key=GROQ_API_KEY)
 
+# anyOf + null разрешает модели передавать null для опциональных полей.
+# Без этого Groq отклоняет вызов с 400 tool_use_failed.
+_nullable_str = lambda desc: {"anyOf": [{"type": "string"}, {"type": "null"}], "description": desc}
+_nullable_int = lambda desc: {"anyOf": [{"type": "integer"}, {"type": "null"}], "description": desc}
 
 # ─── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -24,20 +28,24 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "create_task",
-            "description": "Создать задачу. Указывай importance и energy если понятно из контекста.",
+            "description": (
+                "Создать задачу. Вызывай ТОЛЬКО если пользователь явно говорит о деле которое нужно сделать. "
+                "НЕ создавай задачи для приветствий, вопросов или разговоров."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title":      {"type": "string"},
-                    "priority":   {"type": "string", "enum": ["high", "medium", "low"]},
+                    "title":      {"type": "string", "description": "Название задачи"},
+                    "priority":   {"type": "string", "enum": ["high", "medium", "low"],
+                                   "description": "Приоритет. Используй 'medium' если не ясно."},
                     "importance": {"type": "string", "enum": ["high", "medium", "low"],
-                                   "description": "Важность для достижения целей"},
+                                   "description": "Важность для целей. Используй 'medium' если не ясно."},
                     "energy":     {"type": "string", "enum": ["high", "low"],
-                                   "description": "Сколько энергии требует задача"},
-                    "deadline":   {"type": "string", "description": "YYYY-MM-DD или null"},
-                    "project_id": {"type": "integer", "description": "ID проекта или null"},
+                                   "description": "Энергозатратность задачи."},
+                    "deadline":   _nullable_str("Дедлайн YYYY-MM-DD. null если нет."),
+                    "project_id": _nullable_int("ID проекта. null если нет."),
                 },
-                "required": ["title"],
+                "required": ["title", "priority", "importance", "energy"],
             },
         },
     },
@@ -45,13 +53,13 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_tasks",
-            "description": "Получить список задач. Можно фильтровать по энергии или проекту.",
+            "description": "Получить список задач пользователя.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "show_completed": {"type": "boolean"},
+                    "show_completed": {"type": "boolean", "description": "true чтобы показать выполненные"},
                     "energy":        {"type": "string", "enum": ["high", "low"]},
-                    "project_id":    {"type": "integer"},
+                    "project_id":    _nullable_int("Фильтр по проекту"),
                 },
             },
         },
@@ -60,7 +68,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "complete_task",
-            "description": "Отметить задачу как выполненную.",
+            "description": "Отметить задачу выполненной по ID.",
             "parameters": {
                 "type": "object",
                 "properties": {"task_id": {"type": "integer"}},
@@ -72,7 +80,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "create_project",
-            "description": "Создать проект с целью и статусом.",
+            "description": "Создать проект. Вызывай только если пользователь явно говорит о новом проекте.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -106,9 +114,9 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "project_id": {"type": "integer"},
-                    "name":       {"type": "string"},
+                    "name":       _nullable_str("Новое название"),
                     "status":     {"type": "string", "enum": ["active", "paused", "done"]},
-                    "goal":       {"type": "string"},
+                    "goal":       _nullable_str("Новая цель"),
                 },
                 "required": ["project_id"],
             },
@@ -118,12 +126,12 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "save_note",
-            "description": "Сохранить заметку или идею.",
+            "description": "Сохранить заметку или идею. Только когда пользователь хочет что-то записать.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
-                    "tags":    {"type": "string"},
+                    "tags":    {"type": "string", "description": "Теги через запятую"},
                 },
                 "required": ["content"],
             },
@@ -168,7 +176,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "pin_fact",
-            "description": "Запомнить важный факт о пользователе навсегда.",
+            "description": "Запомнить важный факт о пользователе навсегда (цели, предпочтения, контекст).",
             "parameters": {
                 "type": "object",
                 "properties": {"content": {"type": "string"}},
@@ -228,11 +236,12 @@ def build_system_prompt() -> str:
 
 ## Правила
 - Отвечаешь кратко и по делу, без воды
-- Автоматически создаёшь задачи/заметки/напоминания/проекты через инструменты
-- При создании задачи — указывай importance и energy если ясно из контекста
-- Если знаешь к какому проекту задача — привязывай через project_id
-- Если видишь важный факт о пользователе — сохраняй через pin_fact
-- Всегда отвечаешь на русском
+- Инструменты используй ТОЛЬКО по явному запросу: задачи — если пользователь говорит "сделать/добавить/напомни", заметки — если говорит "запиши/сохрани"
+- На приветствия, вопросы и разговоры — просто отвечай текстом, никаких инструментов
+- При создании задачи: всегда указывай priority, importance, energy (не оставляй null)
+- Если задача явно относится к проекту — привязывай через project_id
+- Важные факты о пользователе сохраняй через pin_fact
+- Отвечай на русском
 - Никакой мотивации ради мотивации — только конкретные действия
 """
 
@@ -257,6 +266,7 @@ def call_llm(messages: list[dict]) -> str:
             break
         except Exception as e:
             logger.warning(f"Model {model} failed: {e}")
+
     if response is None:
         return "❌ Все модели недоступны. Попробуй позже."
 
@@ -271,6 +281,8 @@ def call_llm(messages: list[dict]) -> str:
             func_args = json.loads(tc.function.arguments)
         except json.JSONDecodeError:
             func_args = {}
+        # Clean up null values — use defaults instead
+        func_args = {k: v for k, v in func_args.items() if v is not None}
         tool_func = TOOL_MAP.get(tc.function.name)
         result    = tool_func(**func_args) if tool_func else f"Инструмент {tc.function.name} не найден"
         tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -297,7 +309,6 @@ def call_llm(messages: list[dict]) -> str:
 # ─── Summary generation ────────────────────────────────────────────────────────
 
 def maybe_generate_summary():
-    """Called after each message. Generates summary if SUMMARY_INTERVAL reached."""
     count = count_messages_since_last_summary()
     if count < SUMMARY_INTERVAL:
         return
