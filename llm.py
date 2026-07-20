@@ -281,6 +281,9 @@ def call_llm(messages: list[dict]) -> str:
             func_args = json.loads(tc.function.arguments)
         except json.JSONDecodeError:
             func_args = {}
+        # Guard: json.loads can return None/list for malformed args
+        if not isinstance(func_args, dict):
+            func_args = {}
         # Clean up null values — use defaults instead
         func_args = {k: v for k, v in func_args.items() if v is not None}
         tool_func = TOOL_MAP.get(tc.function.name)
