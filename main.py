@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from groq import Groq
 
 from config import TELEGRAM_TOKEN, GROQ_API_KEY, MY_TELEGRAM_ID, HISTORY_LIMIT, MODELS, WHISPER_MODEL
-from database import init_db, get_conn
+from database import init_db
 from tools import (
     get_last_messages, save_message, clear_history,
     get_tasks, get_reminders, get_profile, set_profile,
@@ -242,18 +242,14 @@ async def maybe_extract_profile(text: str):
 
 async def check_reminders():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM reminders WHERE sent = 0 AND remind_at <= ?", (now,))
-    rows = c.fetchall()
+    rows = get_due_reminders(now)
     for row in rows:
         try:
             await bot.send_message(MY_TELEGRAM_ID, f"⏰ {row['title']}")
-            c.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (row["id"],))
+            mark_reminder_sent(row["id"])
+            logger.info(f"Reminder sent: {row['title']}")
         except Exception as e:
             logger.error(f"Reminder send error: {e}")
-    conn.commit()
-    conn.close()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
