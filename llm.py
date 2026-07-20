@@ -4,9 +4,9 @@ from datetime import datetime
 from groq import Groq
 from config import GROQ_API_KEY, MODELS, SUMMARY_INTERVAL
 from tools import (
-    create_task, get_tasks, complete_task,
+    create_task, get_tasks, complete_task, clear_tasks,
     save_note, search_notes,
-    create_reminder, get_reminders,
+    create_reminder, get_reminders, delete_reminder, clear_reminders,
     pin_fact, load_pinned_facts, get_profile,
     create_project, get_projects, update_project, get_active_projects_summary,
     count_messages_since_last_summary, get_messages_for_summary,
@@ -175,6 +175,41 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "delete_reminder",
+            "description": "Удалить одно напоминание по ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {"reminder_id": {"type": "integer"}},
+                "required": ["reminder_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_reminders",
+            "description": (
+                "Удалить ВСЕ напоминания сразу. "
+                "Используй когда пользователь говорит 'удали все напоминания', "
+                "'очисти напоминания', 'убери все'. Не вызывай delete_reminder по одному."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_tasks",
+            "description": (
+                "Закрыть ВСЕ активные задачи сразу. "
+                "Используй когда пользователь говорит 'очисти задачи', 'удали все задачи'."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "pin_fact",
             "description": "Запомнить важный факт о пользователе навсегда (цели, предпочтения, контекст).",
             "parameters": {
@@ -187,17 +222,20 @@ TOOL_DEFINITIONS = [
 ]
 
 TOOL_MAP = {
-    "create_task":    create_task,
-    "get_tasks":      get_tasks,
-    "complete_task":  complete_task,
-    "create_project": create_project,
-    "get_projects":   get_projects,
-    "update_project": update_project,
-    "save_note":      save_note,
-    "search_notes":   search_notes,
+    "create_task":     create_task,
+    "get_tasks":       get_tasks,
+    "complete_task":   complete_task,
+    "clear_tasks":     clear_tasks,
+    "create_project":  create_project,
+    "get_projects":    get_projects,
+    "update_project":  update_project,
+    "save_note":       save_note,
+    "search_notes":    search_notes,
     "create_reminder": create_reminder,
-    "get_reminders":  get_reminders,
-    "pin_fact":       pin_fact,
+    "get_reminders":   get_reminders,
+    "delete_reminder": delete_reminder,
+    "clear_reminders": clear_reminders,
+    "pin_fact":        pin_fact,
 }
 
 
@@ -284,8 +322,9 @@ def call_llm(messages: list[dict]) -> str:
         # Guard: json.loads can return None/list for malformed args
         if not isinstance(func_args, dict):
             func_args = {}
-        # Clean up null values — use defaults instead
-        func_args = {k: v for k, v in func_args.items() if v is not None}
+        # Remove Python None AND the string "null" that LLMs sometimes emit instead of JSON null
+        _NULL = {None, "null", "None", "undefined"}
+        func_args = {k: v for k, v in func_args.items() if v not in _NULL}
         tool_func = TOOL_MAP.get(tc.function.name)
         result    = tool_func(**func_args) if tool_func else f"Инструмент {tc.function.name} не найден"
         tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": result})
