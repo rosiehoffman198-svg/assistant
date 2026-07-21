@@ -11,21 +11,25 @@ logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
 
 
-def _configure(conn):
-    """Pin every pooled connection to the app timezone so CURRENT_TIMESTAMP/NOW()
-    agree with config.now_local(). TIMEZONE is validated by ZoneInfo at import."""
-    conn.execute(f"SET TIME ZONE '{TIMEZONE}'")
-
-
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is None:
+        # Timezone is set as a libpq startup option instead of a per-connection
+        # `SET TIME ZONE`. A configure function that runs SET leaves the fresh
+        # connection in INTRANS, which psycopg_pool rejects ("connection left in
+        # status INTRANS by configure function: discarded") — it then discards
+        # every connection and the pool can never hand one out. The startup
+        # option pins the zone with no open transaction and no extra round-trip.
+        # TIMEZONE is a valid IANA name (validated by ZoneInfo at import), so it
+        # is safe to inline here.
         _pool = ConnectionPool(
             DATABASE_URL,
             min_size=1,
             max_size=DB_POOL_MAX,
-            configure=_configure,
-            kwargs={"row_factory": dict_row},
+            kwargs={
+                "row_factory": dict_row,
+                "options": f"-c timezone={TIMEZONE}",
+            },
             open=True,
         )
     return _pool
