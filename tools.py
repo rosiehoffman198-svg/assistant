@@ -199,9 +199,23 @@ def save_note(content: str, tags: str = "") -> str:
 
 
 def search_notes(query: str) -> str:
-    # 'russian' stems, so «молока» matches a note saying «молоко», and stopwords
-    # like «как» stop being mandatory AND-terms.
+    query = (query or "").strip()
     with db() as c:
+        if not query:
+            # Если просят "показать все" — отдаём последние 10 заметок
+            c.execute("SELECT id, content, tags, created_at FROM notes ORDER BY created_at DESC LIMIT 10")
+            rows = c.fetchall()
+            if not rows:
+                return "🔍 Заметок пока нет."
+            lines = ["📝 Последние заметки:\n"]
+            for row in rows:
+                preview  = row["content"][:120] + ("…" if len(row["content"]) > 120 else "")
+                tags_str = f" #{row['tags']}" if row["tags"] else ""
+                lines.append(f"[{row['id']}] {preview}\n   {str(row['created_at'])[:10]}{tags_str}\n")
+            return "\n".join(lines)
+
+        # 'russian' stems, so «молока» matches a note saying «молоко», and stopwords
+        # like «как» stop being mandatory AND-terms.
         c.execute("""
             SELECT id, content, tags, created_at,
                    ts_rank(
@@ -223,7 +237,6 @@ def search_notes(query: str) -> str:
         tags_str = f" #{row['tags']}" if row["tags"] else ""
         lines.append(f"[{row['id']}] {preview}\n   {str(row['created_at'])[:10]}{tags_str}\n")
     return "\n".join(lines)
-
 
 # ─── Reminders ─────────────────────────────────────────────────────────────────
 
