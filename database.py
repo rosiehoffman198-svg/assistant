@@ -173,4 +173,110 @@ def init_db():
             "ADD COLUMN IF NOT EXISTS last_message_id INTEGER DEFAULT 0"
         )
 
+        # ─── Universal Inbox ─────────────────────────────────────────────────
+        # Страховочная сетка: сюда падает только то, что LLM не смог уверенно
+        # отнести к задаче/заметке/расходу/здоровью (см. правило в системном
+        # промпте). metadata — JSONB под любые атрибуты (file_id, duration…).
+        c.execute(f"""
+            CREATE TABLE IF NOT EXISTS inbox (
+                id          SERIAL PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                type        TEXT    NOT NULL DEFAULT 'text'
+                            CHECK (type IN ('text','voice','image','document','forward')),
+                content     TEXT    NOT NULL,
+                metadata    JSONB   NOT NULL DEFAULT '{{}}'::jsonb,
+                status      TEXT    NOT NULL DEFAULT 'inbox'
+                            CHECK (status IN ('inbox','task','note','expense','health','done')),
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS inbox_user_status_idx "
+            "ON inbox (user_id, status, created_at DESC)"
+        )
+        add_updated_at_trigger("inbox")
+
+        # ─── Goals ────────────────────────────────────────────────────────────
+        # Цель живёт отдельно от задач/проектов и связана с проектами
+        # многие-ко-многим (цель «Запустить MVP» ↔ Backend / Bot / Landing).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS goals (
+                id          SERIAL PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                title       TEXT    NOT NULL,
+                description TEXT    NOT NULL DEFAULT '',
+                deadline    TEXT,
+                status      TEXT    NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active','done','paused')),
+                priority    TEXT    NOT NULL DEFAULT 'medium'
+                            CHECK (priority IN ('high','medium','low')),
+                kpi         TEXT    NOT NULL DEFAULT '',
+                progress    INTEGER NOT NULL DEFAULT 0
+                            CHECK (progress >= 0 AND progress <= 100),
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS goals_user_status_idx "
+            "ON goals (user_id, status, created_at DESC)"
+        )
+        add_updated_at_trigger("goals")
+
+        # Связка цель ↔ проект (многие-ко-многим). Без FK на проект/цель —
+        # id валидируется в link_goal_project(), как с tasks.project_id.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS goal_projects (
+                goal_id     INTEGER NOT NULL,
+                project_id  INTEGER NOT NULL,
+                PRIMARY KEY (goal_id, project_id)
+            )
+        """)
+
+        # ─── Audit: автообновление updated_at ────────────────────────────────
+        # Одна PL/pgSQL-функция на все таблицы: проставляет updated_at = NOW()
+        # при любом UPDATE. Триггеры на конкретные таблицы навешиваются
+        # additively через add_updated_at_trigger() — по одной строке на таблицу,
+        # никаких хитрых CHECK перед CREATE TRIGGER (их до PG14 нет).
+        c.execute("""
+            CREATE OR REPLACE FUNCTION touch_updated_at()
+            RETURNS trigger AS $$
+            BEGIN
+                NEW.updated_at = NOW();
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """)
+        # Регистрируем таблицы, которым нужен updated_at. Пока список пустой —
+        # модули данных (Phase 1) допишут сюда свои имена через add_updated_at_trigger().
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS _audit_tracked_tables "
+            "(table_name TEXT PRIMARY KEY)"
+        )
+
     logger.info("Schema ready")
+
+
+def add_updated_at_trigger(table_name: str):
+    """Навесить триггер touch_updated_at() на таблицу. Идемпотентно.
+
+    CREATE TRIGGER не имеет IF NOT EXISTS до Postgres 14, поэтому фиксируем
+    факт создания в служебной таблице _audit_tracked_tables и пропускаем
+    повторное создание. Без этого запуск с уже существующей таблицей падал бы.
+    """
+    with db() as c:
+        # INSERT ... ON CONFLICT DO NOTHING фиксирует, что триггер уже навешен.
+        c.execute(
+            "INSERT INTO _audit_tracked_tables (table_name) VALUES (%s) "
+            "ON CONFLICT (table_name) DO NOTHING "
+            "RETURNING table_name",
+            (table_name,),
+        )
+        if c.fetchone() is None:
+            return  # уже было создано ранее — пропускаем
+        c.execute(
+            f"CREATE TRIGGER trg_{table_name}_updated_at "
+            f"BEFORE UPDATE ON {table_name} "
+            f"FOR EACH ROW EXECUTE FUNCTION touch_updated_at()"
+        )

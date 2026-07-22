@@ -12,9 +12,12 @@ from tools import (
     create_reminder, get_reminders,
     pin_fact, load_pinned_facts, get_profile,
     create_project, get_projects, update_project, get_active_projects_summary,
+    add_inbox, get_inbox, resolve_inbox,
+    create_goal, get_goals, update_goal, link_goal_project, get_active_goals_summary,
     get_summary_state, count_messages_since, get_messages_after,
     save_summary, get_latest_summary,
 )
+from constants import InboxType, InboxStatus, GoalStatus, Priority
 
 logger = logging.getLogger(__name__)
 client = Groq(api_key=GROQ_API_KEY)
@@ -29,18 +32,11 @@ LEVELS = ["high", "medium", "low"]
 # ─── Tool definitions ──────────────────────────────────────────────────────────
 
 TOOL_DEFINITIONS = [
-        {
+    {
         "type": "function",
         "function": {
-            "name": "search_notes",
-            "description": "Найти заметки по ключевым словам. Если пользователь просит показать все заметки — вызови без аргументов (пустой запрос).",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": [],  # Убираем обязательный query
-            },
-        },
-    },
+            "name": "create_task",
+            "description": "Создать задачу. Вызывай только когда пользователь явно просит что-то сделать или упоминает конкретное действие.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -150,11 +146,11 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "search_notes",
-            "description": "Найти заметки по ключевым словам.",
+            "description": "Найти заметки по ключевым словам. Если пользователь просит показать все заметки — вызови без аргументов (пустой запрос).",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
-                "required": ["query"],
+                "required": [],  # Убираем обязательный query
             },
         },
     },
@@ -194,6 +190,127 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_inbox",
+            "description": (
+                "ПОСЛЕДНИЙ РЕЗОРТ. Положить запись в Universal Inbox, когда НЕ ясно, "
+                "к чему она относится (размытая идея, «надо подумать», неоднозначное сообщение). "
+                "Если запись ОЧЕВИДНО задача/заметка/расход/здоровье — НЕ клади сюда, "
+                "а вызови сразу create_task / save_note / add_transaction / log_health."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Текст записи как есть"},
+                    "type": {"type": "string", "enum": list(InboxType.ALL),
+                             "description": "Источник записи. По умолчанию 'text'."},
+                    "metadata": {"type": "object",
+                                 "description": "Доп. атрибуты (file_id, duration, mime…). Опционально."},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_inbox",
+            "description": "Показать записи Universal Inbox. По умолчанию — нераспределённые.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": list(InboxStatus.ALL),
+                               "description": "Фильтр по статусу. По умолчанию 'inbox'."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resolve_inbox",
+            "description": "Отметить запись Inbox как обработанную (после того, как пользователь её разобрал).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "integer"},
+                    "action": {"type": "string", "enum": list(InboxStatus.ALL),
+                               "description": "Новый статус. 'done' — закрыто как нерелевантное."},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_goal",
+            "description": "Создать цель. Цель — это крупный результат (например «Запустить MVP»), связывается с проектами.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title":       {"type": "string", "description": "Название цели"},
+                    "description": _nullable_str("Описание цели"),
+                    "deadline":    _nullable_str("Срок YYYY-MM-DD. null если нет."),
+                    "priority":    {"type": "string", "enum": ["high","medium","low"],
+                                    "description": "Приоритет. 'medium' если не ясно."},
+                    "kpi":         _nullable_str("Измеримый KPI цели"),
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_goals",
+            "description": "Показать цели пользователя. Без аргументов — активные.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status_filter": {"type": "string", "enum": list(GoalStatus.ALL),
+                                      "description": "Фильтр по статусу. Опционально."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_goal",
+            "description": "Обновить цель: статус, приоритет, прогресс (0-100), KPI, описание, дедлайн.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id":     {"type": "integer"},
+                    "status":      {"type": "string", "enum": list(GoalStatus.ALL)},
+                    "priority":    {"type": "string", "enum": ["high","medium","low"]},
+                    "progress":    {"type": "integer", "description": "0-100"},
+                    "kpi":         _nullable_str("Новый KPI"),
+                    "description": _nullable_str("Новое описание"),
+                    "deadline":    _nullable_str("Новый срок YYYY-MM-DD"),
+                },
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "link_goal_project",
+            "description": "Связать цель с проектом (одна цель — много проектов).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id":    {"type": "integer"},
+                    "project_id": {"type": "integer"},
+                },
+                "required": ["goal_id", "project_id"],
+            },
+        },
+    },
 ]
 
 TOOL_MAP = {
@@ -208,6 +325,13 @@ TOOL_MAP = {
     "create_reminder": create_reminder,
     "get_reminders":   get_reminders,
     "pin_fact":        pin_fact,
+    "add_inbox":       add_inbox,
+    "get_inbox":       get_inbox,
+    "resolve_inbox":   resolve_inbox,
+    "create_goal":     create_goal,
+    "get_goals":       get_goals,
+    "update_goal":     update_goal,
+    "link_goal_project": link_goal_project,
 }
 
 
@@ -289,6 +413,7 @@ def build_system_prompt() -> str:
     profile  = get_profile()
     pinned   = load_pinned_facts()
     projects = get_active_projects_summary()
+    goals_block = get_active_goals_summary()
     summary  = get_latest_summary()
     now      = now_local().strftime("%Y-%m-%d %H:%M")
 
@@ -297,7 +422,7 @@ def build_system_prompt() -> str:
     style = profile.get("style", "краткий и прямой")
     extra = profile.get("extra", "")
 
-        return f"""Ты — личный AI-ассистент.
+    return f"""Ты — личный AI-ассистент.
 
 Сейчас: {now}
 
@@ -306,6 +431,9 @@ def build_system_prompt() -> str:
 - Цели: {goals}
 - Стиль: {style}
 {('- ' + extra) if extra else ''}
+
+## 🎯 Активные цели
+{goals_block if goals_block else '(нет)'}
 
 ## Активные проекты
 {projects if projects else '(нет)'}
@@ -324,6 +452,7 @@ def build_system_prompt() -> str:
 - Время для напоминаний — всегда YYYY-MM-DD HH:MM с ведущими нулями
 - Привязывай задачу к проекту только если этот ID есть в списке активных проектов выше
 - Важные факты о пользователе сохраняй через pin_fact
+- Universal Inbox: если запись ОЧЕВИДНО относится к задаче/заметке/расходу/здоровью — создай её напрямую нужным инструментом. В Inbox (add_inbox) клади ТОЛЬКО неоднозначное («есть идея бизнеса», «надо обдумать»). Не спрашивай «это задача или идея?» — если сомневаешься, клади в Inbox.
 - Отвечай на русском
 - Никакой мотивации ради мотивации — только конкретные действия
 """

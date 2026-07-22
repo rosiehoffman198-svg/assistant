@@ -1,8 +1,11 @@
+import json
 import logging
 import re
 from datetime import datetime
 
 from config import TASKS_LIMIT
+from constants import InboxStatus, InboxType
+from ctx import current_user_id
 from database import db
 
 logger = logging.getLogger(__name__)
@@ -293,6 +296,314 @@ def get_due_reminders(now: datetime) -> list:
 def mark_reminder_sent(reminder_id: int):
     with db() as c:
         c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (reminder_id,))
+
+
+# ─── Universal Inbox ───────────────────────────────────────────────────────────
+# Страховочная сетка: сюда падает только то, что LLM не смог уверенно отнести
+# к задаче/заметке/расходу/здоровью. Основной путь — прямое создание в нужном
+# модуле (правило в системном промпте). Inbox — fallback, не «главная папка».
+
+INBOX_LIMIT = 20  # верхняя граница выдачи /inbox (читаемость и токены)
+
+_TYPE_ICONS = {
+    InboxType.TEXT: "💬",
+    InboxType.VOICE: "🎤",
+    InboxType.IMAGE: "🖼",
+    InboxType.DOCUMENT: "📎",
+    InboxType.FORWARD: "↪️",
+}
+_STATUS_ICONS = {
+    InboxStatus.INBOX: "📥",
+    InboxStatus.TASK: "✅→задача",
+    InboxStatus.NOTE: "✅→заметка",
+    InboxStatus.EXPENSE: "✅→расход",
+    InboxStatus.HEALTH: "✅→здоровье",
+    InboxStatus.DONE: "✔️ закрыто",
+}
+
+
+def add_inbox(content: str, type: str = InboxType.TEXT, metadata: dict = None) -> str:
+    """Бросить запись в Inbox. user_id берётся из контекста, не из аргументов.
+
+    metadata — произвольный JSONB (file_id, duration, mime, photo…). Если
+    передан не-словарь — сохраняем как '{}', лучше пустой JSON, чем упавший INSERT.
+    """
+    if type not in InboxType.ALL:
+        return f"❌ Неизвестный тип inbox: {type!r}"
+    meta_str = json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else "{}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            """INSERT INTO inbox (user_id, type, content, metadata)
+               VALUES (%s, %s, %s, %s::jsonb) RETURNING id""",
+            (uid, type, content, meta_str),
+        )
+        iid = c.fetchone()["id"]
+    icon = _TYPE_ICONS.get(type, "📥")
+    return f"{icon} В Inbox [{iid}]: {content}"
+
+
+def get_inbox(status: str = InboxStatus.INBOX) -> str:
+    """Показать записи Inbox. По умолчанию — нераспределённые (status=inbox)."""
+    if status not in InboxStatus.ALL:
+        return f"❌ Неизвестный статус inbox: {status!r}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            "SELECT id, type, content, metadata, status, created_at "
+            "FROM inbox WHERE user_id = %s AND status = %s "
+            "ORDER BY created_at DESC LIMIT %s",
+            (uid, status, INBOX_LIMIT + 1),
+        )
+        rows = c.fetchall()
+    if not rows:
+        label = "нераспределённые" if status == InboxStatus.INBOX else f"со статусом «{status}»"
+        return f"📥 В Inbox {label} записи отсутствуют."
+    truncated = len(rows) > INBOX_LIMIT
+    rows = rows[:INBOX_LIMIT]
+
+    header = "📥" if status == InboxStatus.INBOX else f"📥 (статус: {status})"
+    lines = [f"{header} Inbox:\n"]
+    for row in rows:
+        icon = _TYPE_ICONS.get(row["type"], "📥")
+        preview = row["content"][:140] + ("…" if len(row["content"]) > 140 else "")
+        date_str = str(row["created_at"])[:10]
+        lines.append(f"{icon} [{row['id']}] {preview}\n   {date_str}")
+    if truncated:
+        lines.append(f"\n… показаны первые {INBOX_LIMIT}.")
+    return "\n".join(lines)
+
+
+def resolve_inbox(item_id: int, action: str = InboxStatus.DONE) -> str:
+    """Отметить запись Inbox как обработанную (статус task/note/done/...).
+
+    Сама запись НЕ создаёт задачу/заметку elsewhere — это лишь отметка, что
+    пользователь вручную разобрал запись. Прямое создание делает LLM через
+    create_task/save_note/..., а сюда запись попадает если уже создана.
+    """
+    if action not in InboxStatus.ALL:
+        return f"❌ Неизвестное действие: {action!r}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            "UPDATE inbox SET status = %s WHERE id = %s AND user_id = %s RETURNING content",
+            (action, item_id, uid),
+        )
+        row = c.fetchone()
+    if not row:
+        return f"❌ Запись [{item_id}] не найдена в твоём Inbox."
+    label = _STATUS_ICONS.get(action, action)
+    return f"{label}: «{row['content'][:80]}»"
+
+
+def get_inbox_count() -> int:
+    """Сколько нераспределённых записей в Inbox текущего пользователя.
+    Для Dashboard — число, а не строка."""
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            "SELECT COUNT(*) AS n FROM inbox WHERE user_id = %s AND status = 'inbox'",
+            (uid,),
+        )
+        return c.fetchone()["n"]
+
+
+# ─── Goals ─────────────────────────────────────────────────────────────────────
+
+GOALS_LIMIT = 25
+GOAL_STATUS_ICONS = {"active": "🎯", "done": "✅", "paused": "⏸"}
+GOAL_PRIORITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+_PRIORITY_ORDER = {"high": 1, "medium": 2, "low": 3}
+
+
+def create_goal(
+    title: str,
+    description: str = "",
+    deadline: str = None,
+    priority: str = "medium",
+    kpi: str = "",
+) -> str:
+    """Создать цель. priority/status имеют дефолты, чтобы LLM мог вызвать с минимумом."""
+    if priority not in ("high", "medium", "low"):
+        return f"❌ Неизвестный приоритет: {priority!r}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            """INSERT INTO goals (user_id, title, description, deadline, priority, kpi)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+            (uid, title, description, deadline, priority, kpi),
+        )
+        gid = c.fetchone()["id"]
+    p_icon = GOAL_PRIORITY_ICONS.get(priority, "⚪")
+    dl = f" (до {deadline})" if deadline else ""
+    return f"🎯 Цель [{gid}] {p_icon} {title}{dl}"
+
+
+def get_goals(status_filter: str = None) -> str:
+    """Показать цели. По умолчанию — активные, отсортированы по приоритету."""
+    if status_filter and status_filter not in ("active", "done", "paused"):
+        return f"❌ Неизвестный статус: {status_filter!r}"
+    uid = current_user_id()
+    with db() as c:
+        if status_filter:
+            c.execute(
+                """SELECT id, title, description, deadline, status, priority, kpi, progress,
+                          created_at
+                   FROM goals WHERE user_id = %s AND status = %s
+                   ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                            created_at LIMIT %s""",
+                (uid, status_filter, GOALS_LIMIT + 1),
+            )
+        else:
+            # без фильтра — только активные (архив done/paused по запросу)
+            c.execute(
+                """SELECT id, title, description, deadline, status, priority, kpi, progress,
+                          created_at
+                   FROM goals WHERE user_id = %s AND status = 'active'
+                   ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                            created_at LIMIT %s""",
+                (uid, GOALS_LIMIT + 1),
+            )
+        rows = c.fetchall()
+    if not rows:
+        return "🎯 Активных целей нет"
+    truncated = len(rows) > GOALS_LIMIT
+    rows = rows[:GOALS_LIMIT]
+
+    # Подгружаем связанные проекты одним запросом
+    gids = [r["id"] for r in rows]
+    proj_map: dict[int, list[str]] = {}
+    if gids:
+        with db() as c:
+            c.execute(
+                """SELECT gp.goal_id, p.name
+                   FROM goal_projects gp JOIN projects p ON p.id = gp.project_id
+                   WHERE gp.goal_id = ANY(%s)""",
+                (gids,),
+            )
+            for row in c.fetchall():
+                proj_map.setdefault(row["goal_id"], []).append(row["name"])
+
+    header = "🎯 Цели:" if not status_filter else f"🎯 Цели ({status_filter}):"
+    lines = [header + "\n"]
+    for r in rows:
+        p_icon = GOAL_PRIORITY_ICONS.get(r["priority"], "⚪")
+        bar = _progress_bar(r["progress"])
+        dl = f" — до {r['deadline']}" if r["deadline"] else ""
+        lines.append(f"{p_icon} [{r['id']}] {r['title']}{dl} {bar}")
+        if r["kpi"]:
+            lines.append(f"   📊 KPI: {r['kpi']}")
+        if r["description"]:
+            preview = r["description"][:120] + ("…" if len(r["description"]) > 120 else "")
+            lines.append(f"   {preview}")
+        if r["id"] in proj_map:
+            lines.append(f"   🔗 Проекты: {', '.join(proj_map[r['id']])}")
+    if truncated:
+        lines.append(f"\n… показаны первые {GOALS_LIMIT}.")
+    return "\n".join(lines)
+
+
+def update_goal(
+    goal_id: int,
+    status: str = None,
+    priority: str = None,
+    progress: int = None,
+    kpi: str = None,
+    description: str = None,
+    deadline: str = None,
+) -> str:
+    """Обновить поля цели. progress 0-100; при status='done' progress=100 автоматически."""
+    if status and status not in ("active", "done", "paused"):
+        return f"❌ Неизвестный статус: {status!r}"
+    if priority and priority not in ("high", "medium", "low"):
+        return f"❌ Неизвестный приоритет: {priority!r}"
+    if progress is not None and not (0 <= progress <= 100):
+        return f"❌ Прогресс должен быть 0-100, получено {progress}"
+
+    uid = current_user_id()
+    updates, values = [], []
+    if status is not None:
+        updates.append("status = %s")
+        values.append(status)
+        if status == "done":
+            updates.append("progress = 100")
+    if priority is not None:
+        updates.append("priority = %s")
+        values.append(priority)
+    if progress is not None:
+        updates.append("progress = %s")
+        values.append(progress)
+    if kpi is not None:
+        updates.append("kpi = %s")
+        values.append(kpi)
+    if description is not None:
+        updates.append("description = %s")
+        values.append(description)
+    if deadline is not None:
+        updates.append("deadline = %s")
+        values.append(deadline)
+    if not updates:
+        return "❌ Нечего обновлять"
+
+    values += [goal_id, uid]
+    with db() as c:
+        c.execute(
+            f"UPDATE goals SET {', '.join(updates)} WHERE id = %s AND user_id = %s RETURNING title",
+            values,
+        )
+        row = c.fetchone()
+    if not row:
+        return f"❌ Цель [{goal_id}] не найдена"
+    return f"✅ Цель [{goal_id}] обновлена"
+
+
+def link_goal_project(goal_id: int, project_id: int) -> str:
+    """Связать цель с проектом (многие-ко-многим). Оба id валидируются."""
+    uid = current_user_id()
+    with db() as c:
+        # Цель — у текущего пользователя
+        c.execute("SELECT 1 FROM goals WHERE id = %s AND user_id = %s", (goal_id, uid))
+        if c.fetchone() is None:
+            return f"❌ Цель [{goal_id}] не найдена"
+        # Проект — глобальный (в projects нет user_id по решению Phase 1.0)
+        c.execute("SELECT name FROM projects WHERE id = %s", (project_id,))
+        prow = c.fetchone()
+        if prow is None:
+            return f"❌ Проект [{project_id}] не найден"
+        c.execute(
+            "INSERT INTO goal_projects (goal_id, project_id) VALUES (%s, %s) "
+            "ON CONFLICT (goal_id, project_id) DO NOTHING",
+            (goal_id, project_id),
+        )
+    return f"🔗 Цель [{goal_id}] ↔ проект «{prow['name']}»"
+
+
+def get_active_goals_summary() -> str:
+    """Краткий блок для системного промпта (одна строка на цель, как с проектами)."""
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            """SELECT id, title, priority, progress
+               FROM goals WHERE user_id = %s AND status = 'active'
+               ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                        created_at LIMIT 10""",
+            (uid,),
+        )
+        rows = c.fetchall()
+    if not rows:
+        return ""
+    icons = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+    lines = []
+    for r in rows:
+        icon = icons.get(r["priority"], "•")
+        lines.append(f"{icon} [{r['id']}] {r['title']} ({r['progress']}%)")
+    return "\n".join(lines)
+
+
+def _progress_bar(progress: int) -> str:
+    """10-сегментный текстовый прогресс-бар: ▰▰▰▰▱▱▱▱▱▱"""
+    filled = max(0, min(10, round(progress / 10)))
+    return "▰" * filled + "▱" * (10 - filled) + f" {progress}%"
 
 
 # ─── Pinned facts ──────────────────────────────────────────────────────────────

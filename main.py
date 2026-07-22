@@ -23,8 +23,11 @@ from tools import (
     get_tasks, get_reminders, get_profile, set_profile,
     load_pinned_facts, search_notes, complete_task,
     get_due_reminders, mark_reminder_sent, clear_pinned_facts,
+    get_inbox, resolve_inbox,
+    get_goals,
     PROFILE_KEYS,
 )
+from ctx import CURRENT_USER_ID
 from llm import call_llm, maybe_generate_summary
 
 logging.basicConfig(
@@ -57,6 +60,9 @@ def owner_only(func):
     async def wrapper(message: Message, **kwargs):
         if message.from_user.id != MY_TELEGRAM_ID:
             return
+        # Контекст пользователя для всех tools.py-вызовов (включая slash-команды,
+        # которые идут через asyncio.to_thread минуя process_message).
+        CURRENT_USER_ID.set(message.from_user.id)
         return await func(message)
     return wrapper
 
@@ -246,7 +252,36 @@ async def cmd_done(message: Message):
     await reply(message, await asyncio.to_thread(complete_task, int(parts[1])))
 
 
-# ─── Voice messages ───────────────────────────────────────────────────────────
+@dp.message(Command("inbox"))
+@handler
+async def cmd_inbox(message: Message):
+    # /inbox            — нераспределённые
+    # /inbox all        — все статусы тоже не имеет смысла; фильтр по статусу:
+    # /inbox done       — закрытые и т.п.
+    parts = message.text.split(maxsplit=1)
+    status = parts[1].strip() if len(parts) > 1 else None
+    await reply(message, await asyncio.to_thread(get_inbox, status))
+
+
+@dp.message(Command("resolve"))
+@handler
+async def cmd_resolve(message: Message):
+    # /resolve <id> [action]   action: task|note|expense|health|done (по умолчанию done)
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await reply(message, "Укажи ID: /resolve [id] [done|task|note|expense|health]")
+        return
+    item_id = int(parts[1])
+    action = parts[2] if len(parts) > 2 else None
+    await reply(message, await asyncio.to_thread(resolve_inbox, item_id, action))
+
+
+@dp.message(Command("goals"))
+@handler
+async def cmd_goals(message: Message):
+    parts = message.text.split(maxsplit=1)
+    status = parts[1].strip() if len(parts) > 1 else None
+    await reply(message, await asyncio.to_thread(get_goals, status))
 
 def transcribe(path: str) -> str:
     with open(path, "rb") as audio:
@@ -315,6 +350,12 @@ async def unknown_command(message: Message):
 # ─── Core processing ──────────────────────────────────────────────────────────
 
 async def process_message(message: Message, text: str):
+    # user_id протекает в tools.py через ContextVar. asyncio.to_thread копирует
+    # контекст в рабочий поток, поэтому call_llm → _run_tool → add_inbox и т.д.
+    # видят правильного пользователя. Поле НЕ передаётся как аргумент инструмента,
+    # так что LLM не может его «галлюцинировать».
+    CURRENT_USER_ID.set(message.from_user.id)
+
     await asyncio.to_thread(save_message, "user", text)
 
     # Background summary, off the event loop and off the response path.
