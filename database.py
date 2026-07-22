@@ -195,7 +195,6 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS inbox_user_status_idx "
             "ON inbox (user_id, status, created_at DESC)"
         )
-        add_updated_at_trigger("inbox")
 
         # ─── Goals ────────────────────────────────────────────────────────────
         # Цель живёт отдельно от задач/проектов и связана с проектами
@@ -222,7 +221,6 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS goals_user_status_idx "
             "ON goals (user_id, status, created_at DESC)"
         )
-        add_updated_at_trigger("goals")
 
         # Связка цель ↔ проект (многие-ко-многим). Без FK на проект/цель —
         # id валидируется в link_goal_project(), как с tasks.project_id.
@@ -254,6 +252,11 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS _audit_tracked_tables "
             "(table_name TEXT PRIMARY KEY)"
         )
+
+    # Триггеры updated_at — ЗА пределами with db(), иначе новое соединение
+    # в add_updated_at_trigger() не видит ещё не закоммиченные таблицы.
+    add_updated_at_trigger("inbox")
+    add_updated_at_trigger("goals")
 
     logger.info("Schema ready")
 
