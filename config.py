@@ -42,7 +42,7 @@ if not DATABASE_URL:
 
 # Единая таймзона для всего приложения: наивные datetime в коде, сессия БД и
 # промпт модели используют её же, поэтому времена везде сопоставимы.
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent")
 try:
     TZ = ZoneInfo(TIMEZONE)
 except Exception as e:
