@@ -90,7 +90,7 @@ def get_active_projects_summary() -> str:
             FROM projects p
             LEFT JOIN tasks t ON t.project_id = p.id
             WHERE p.status = 'active'
-            GROUP BY p.id ORDER BY p.created_at LIMIT 5
+            GROUP BY p.id ORDER BY p.created_at LIMIT 25
         """)
         rows = c.fetchall()
     if not rows:
